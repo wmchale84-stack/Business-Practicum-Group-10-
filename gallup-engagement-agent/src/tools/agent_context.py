@@ -33,9 +33,13 @@ import pandas as pd
 
 from .action_tools import DISCLAIMER, plan_resources_summary
 from .dashboard import kpi_tiles, team_watchlist, where_we_stand
-from .financial import (
+from .financial_updated import (
+    default_assumptions,
     Assumptions,
     current_costs,
+    department_excess_cost,
+    money_warning,
+    team_cost_persistence,
     engagement_value,
     money,
     team_excess_cost,
@@ -353,8 +357,14 @@ def _financials(df, analysis, change, a, risk_results=None) -> dict:
     }
     if analysis is not None:
         value = engagement_value(df, analysis, a)
+        low, high = value["range"]
+        program = value.get("program")
         section["what_engagement_could_be_worth_per_year"] = {
             "total": money(value["total"], c),
+            "likely_range": f"{money(low, c)} to {money(high, c)} (sampling error only)",
+            "program": (f"Everyone who answers 1-3 on {program['names']} moves up one point, "
+                        "counted once per person; not a sum of separate programs."
+                        if program else ""),
             "scenarios": [{"area": r["source"], "assumes": r["what"],
                            "result": f"{r['units']:,.0f} {r['unit_label']}",
                            "value": money(r["value"], c)}
@@ -370,15 +380,31 @@ def _financials(df, analysis, change, a, risk_results=None) -> dict:
                                "score; Protect = high impact, already strong. Values overlap "
                                "across factors, so never add them together."),
             }
+    note = money_warning(df, _health(analysis))
+    if note:
+        section["survey_response_warning"] = note
+    departments = department_excess_cost(df, a)
+    over = departments[departments["excess_cost"] > 0] if not departments.empty else departments
+    if not over.empty:
+        section["costliest_departments_vs_company_rate"] = [
+            f"{r['department']}: {money(r['excess_cost'], c)} a year above what the company "
+            "rate would cost" for _, r in over.head(3).iterrows()]
     teams = team_excess_cost(df, a)
+    persistence = team_cost_persistence(df, a)
+    section["team_ranking_check"] = persistence["text"]
     above = teams[teams["excess_cost"] > 0]
+    if not above.empty and persistence["status"] == "failed":
+        section["team_ranking_note"] = ("Team-level extra costs did not hold up from one year "
+                                        "to the next, so do not name individual teams; use the "
+                                        "department figures.")
+        above = above.iloc[0:0]
     if not above.empty:
         section["costliest_teams_vs_company_rate"] = [
             f"{r['team_id']} ({r.get('department', '')}): {money(r['excess_cost'], c)} a year "
             "above what the company rate would cost"
             for _, r in above.head(5).iterrows()]
         section["where_costs_sit"] = (
-            f"{len(above)} teams cost {money(above['excess_cost'].sum(), c)} a year more in "
+            f"{len(above):,} teams cost {money(above['excess_cost'].sum(), c)} a year more in "
             "turnover and absence than the company rate would for teams their size. This is "
             "where today's costs are concentrated, not a saving or a forecast.")
     section["limit"] = ("Estimates from the user's cost assumptions, not measured profit; "
@@ -415,7 +441,7 @@ def build_context(df: pd.DataFrame, analysis: dict | None = None,
                   sections: list[str] | None = None) -> dict[str, Any]:
     """Facts for the requested sections (all by default). A section that cannot
     be built is replaced by a short note instead of failing the whole answer."""
-    a = assumptions or Assumptions(headcount=len(analysis_frame(df)))
+    a = assumptions or default_assumptions(df)
     wanted = sections or list(BUILDERS)
     needs_risk = {"teams", "recommendations", "predictions"} & set(wanted)
     risk_results = _risk_results(df, analysis) if needs_risk else None

@@ -9,7 +9,7 @@ from src.agent import DEFAULT_DATASET
 from src.tools.analytics import analyze_dataframe
 from src.tools.ceo_brief import brief_for_screen, brief_markdown, build_ceo_brief
 from src.tools.dashboard import kpi_tiles
-from src.tools.financial import Assumptions, current_costs, money
+from src.tools.financial_updated import Assumptions, current_costs, money
 from src.tools.health_check import check_upload
 from src.tools.insights import analysis_frame
 from src.tools.priorities import factor_value

@@ -6,7 +6,7 @@ import pytest
 from src.agent import DEFAULT_DATASET
 from src.tools.agent_context import build_context, route_sections
 from src.tools.analytics import analyze_dataframe
-from src.tools.financial import Assumptions, engagement_value
+from src.tools.financial_updated import Assumptions, engagement_value
 from src.tools.health_check import check_upload
 from src.tools.insights import analysis_frame, dollar_impact
 from src.tools.priorities import (
