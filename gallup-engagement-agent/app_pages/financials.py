@@ -278,8 +278,8 @@ if analysis is not None:
                     ("Return on investment", f"{base['roi']:.0%}",
                      f"{low_case['roi']:.0%} to {high_case['roi']:.0%}"),
                     ("Payback", ("not reached" if base["payback_months"] == float("inf")
-                                 else f"{base['payback_months']:.1f} months"),
-                     f"program cost {money(economics['cost'], c)} a year"),
+                                 else f"{base['payback_months']:.1f} mo."),
+                     f"cost {money(economics['cost'], c)}/yr"),
                     ("Break-even cost", money(economics["break_even_cost"], c),
                      f"{money(economics['break_even_cost_per_person'], c)} per person"),
                 ]
