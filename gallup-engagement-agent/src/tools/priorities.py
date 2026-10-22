@@ -44,7 +44,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 
-from .financial_updated import ABSENCE, TURNOVER, Assumptions, md, money
+from .financial_updated import ABSENCE, TURNOVER, Assumptions, md, money, resolve_point_value
 from .insights import ITEM_LABELS, Q12_ITEMS, _robust_favorable, analysis_frame
 
 
@@ -94,7 +94,7 @@ def _factor_physical(df: pd.DataFrame, analysis: dict) -> dict[str, Any]:
 
     unit = Assumptions(headcount=len(sample))
     findings = _robust_favorable(analysis["findings"])
-    fits: dict = {}
+    fits = analysis.setdefault("_fit_cache", {})        # coefficients only; shared with Scenarios
     rows = {}
     for item in dict.fromkeys(findings["item"]):
         sim = simulate(df, analysis, {item: 1.0}, unit, who="low", ramp_months=0, fits=fits)
@@ -121,6 +121,7 @@ def factor_value(df: pd.DataFrame, analysis: dict | None, a: Assumptions,
     findings = _robust_favorable(analysis["findings"])
     if findings.empty:
         return pd.DataFrame(columns=COLUMNS)
+    a = resolve_point_value(df, a)           # performance priced from SD of productivity, if given
 
     physical = _factor_physical(df, analysis)
     scale = a.scale(physical["n"])

@@ -44,7 +44,7 @@ later, they can be modeled directly as an outcome instead of estimated here.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import altair as alt
@@ -77,6 +77,11 @@ class Assumptions:
     value_per_rating_point: float = 0.0        # yearly value of +1 performance point per person
     headcount: int | None = None               # None -> people in the data
     currency: str = "$"
+    # EV additions (branch Will, from Sunny's EV brief and the Gallup utility-analysis notes)
+    program_cost: float = 0.0                  # yearly cost of the program being evaluated (0 = not entered)
+    effect_realization: float = 1.0            # share of the modeled effect the program really delivers
+    sd_productivity_pct: float = 0.0           # SD of the yearly value of productivity, share of salary (0 = off)
+    sources: dict = field(default_factory=dict)  # assumption name -> where the number came from
 
     @property
     def cost_per_leaver(self) -> float:
@@ -133,6 +138,79 @@ def unit_assumptions(a: Assumptions) -> Assumptions:
     return replace(a, headcount=None)
 
 
+SOURCE_DEFAULT = "Application default (placeholder)"
+SOURCE_USER = "User-entered (source not stated)"
+SOURCE_DATA = "Taken from your data"
+SOURCE_OPTIONS = ["Company-provided", "External benchmark", "My own scenario assumption"]
+
+REGISTER_ROWS = [
+    ("avg_salary", "Average salary per year"),
+    ("replacement_cost_pct", "Cost to replace one leaver (share of salary)"),
+    ("absence_day_cost", "Cost of one unplanned absence day"),
+    ("value_per_rating_point", "Value of +1 performance point, per person per year"),
+    ("sd_productivity_pct", "SD of productivity value (share of salary)"),
+    ("headcount", "Company headcount"),
+    ("program_cost", "Yearly program cost"),
+    ("effect_realization", "Share of the modeled effect the program delivers"),
+]
+
+
+def resolve_point_value(df: pd.DataFrame, a: Assumptions) -> Assumptions:
+    """Price a performance point from the utility-analysis formula when the user gave an
+    SD of productivity value but no value per rating point.
+
+    Hunter-Schmidt / Brogden-Cronbach-Gleser utility analysis (the method Gallup cites for
+    its productivity estimates): gain = people × effect × SDy × change in standard units.
+    The performance model here is z-scored on both sides, so its standardized beta is the
+    effect and value of one rating point = SDy ÷ standard deviation of the rating,
+    with SDy = salary × sd_productivity_pct. An explicit value per point always wins."""
+    if a.value_per_rating_point > 0 or a.sd_productivity_pct <= 0:
+        return a
+    data = outcome_frame(df)
+    if "performance_rating" not in data.columns:
+        return a
+    sd = float(pd.to_numeric(data["performance_rating"], errors="coerce").std())
+    if not sd > 0:
+        return a
+    return replace(a, value_per_rating_point=a.avg_salary * a.sd_productivity_pct / sd)
+
+
+def assumption_register(a: Assumptions, sample: int | None = None) -> pd.DataFrame:
+    """Every economic input with its value and where it came from. A number is labelled
+    'application default' only while it still equals the placeholder."""
+    default = Assumptions()
+    shown = {
+        "avg_salary": f"{a.currency}{a.avg_salary:,.0f}",
+        "replacement_cost_pct": f"{a.replacement_cost_pct:.0%} ({a.currency}{a.cost_per_leaver:,.0f} per leaver)",
+        "absence_day_cost": (f"{a.currency}{a.day_cost:,.0f}"
+                             + ("" if a.absence_day_cost else " (salary ÷ 260 workdays)")),
+        "value_per_rating_point": (f"{a.currency}{a.value_per_rating_point:,.0f}"
+                                   if a.value_per_rating_point > 0 else "not counted"),
+        "sd_productivity_pct": f"{a.sd_productivity_pct:.0%}" if a.sd_productivity_pct > 0 else "off",
+        "headcount": (f"{a.headcount:,}" if a.headcount else
+                      (f"{sample:,} (all employees in the data)" if sample else "all employees in the data")),
+        "program_cost": (f"{a.currency}{a.program_cost:,.0f}" if a.program_cost > 0 else "not entered"),
+        "effect_realization": f"{a.effect_realization:.0%}",
+    }
+    rows = []
+    for key, label in REGISTER_ROWS:
+        value, base = getattr(a, key), getattr(default, key)
+        if key in a.sources:
+            source = a.sources[key]
+        elif key == "headcount" and not a.headcount:
+            source = SOURCE_DATA
+        elif key == "headcount":
+            source = SOURCE_USER if (sample is None or a.headcount != sample) else SOURCE_DATA
+        elif key in ("program_cost",) and not value:
+            source = "Not entered"
+        elif value == base:
+            source = SOURCE_DEFAULT
+        else:
+            source = SOURCE_USER
+        rows.append({"assumption": label, "value": shown[key], "source": source})
+    return pd.DataFrame(rows)
+
+
 # PROCESS 4 – WHAT IT COSTS TODAY
 
 def current_costs(df: pd.DataFrame, a: Assumptions) -> dict[str, Any]:
@@ -169,7 +247,8 @@ def engagement_value(df: pd.DataFrame, analysis: dict | None, a: Assumptions,
                      plans: pd.DataFrame | None = None,
                      tiers: list[str] | None = None,
                      factors: pd.DataFrame | None = None,
-                     items: list[str] | None = None) -> dict[str, Any]:
+                     items: list[str] | None = None,
+                     fits: dict | None = None) -> dict[str, Any]:
     """Yearly value of one named program plus the optional productivity plans.
 
     The program lifts every question in `items` by one point for the people who answer
@@ -179,8 +258,10 @@ def engagement_value(df: pd.DataFrame, analysis: dict | None, a: Assumptions,
     from .scenario import simulate                # local import: scenario imports this module
 
     scenarios: list[dict[str, Any]] = []
+    warnings: list[str] = []
     program: dict[str, Any] | None = None
     low_total = high_total = 0.0
+    a = resolve_point_value(df, a)
 
     if analysis is not None:
         items = items if items is not None else _program_items(df, analysis, a, factors)
@@ -188,7 +269,8 @@ def engagement_value(df: pd.DataFrame, analysis: dict | None, a: Assumptions,
             from .audit import audit_sample
             from .insights import ITEM_LABELS
 
-            sim = simulate(df, analysis, {i: 1.0 for i in items}, a, who="low", ramp_months=0)
+            sim = simulate(df, analysis, {i: 1.0 for i in items}, a, who="low", ramp_months=0,
+                           fits=fits)
             t = sim["totals"]
             sample = audit_sample(df)
             scale = a.scale(len(sample))
@@ -221,7 +303,14 @@ def engagement_value(df: pd.DataFrame, analysis: dict | None, a: Assumptions,
             if scenarios:
                 program = {"items": list(items), "names": names, "people": helped,
                            "value": sum(s["value"] for s in scenarios),
-                           "low": low_total, "high": high_total}
+                           "low": low_total, "high": high_total,
+                           "physical": {b: {"leavers": t[b]["leavers"],
+                                            "absence_days": t[b]["absence_days"]}
+                                        for b in ("estimate", "cautious", "optimistic")}}
+                if len(items) > 1:
+                    warnings.append("The questions in the program overlap (the same people answer "
+                                    "them), so the program is simulated jointly and counted once; "
+                                    "do not add the single-question values.")
 
     if plans is not None and a.value_per_rating_point > 0:
         data = outcome_frame(df)
@@ -242,16 +331,116 @@ def engagement_value(df: pd.DataFrame, analysis: dict | None, a: Assumptions,
             low_total += value
             high_total += value
 
+    if program and any(s["source"] == "Productivity" for s in scenarios):
+        warnings.append("The productivity row and the turnover and absence program describe "
+                        "different pathways, but they can rest on the same engagement lifts and "
+                        "the same people, so treat their sum as an upper bound.")
     table = pd.DataFrame(scenarios, columns=["source", "lever", "what", "units",
                                              "unit_label", "value", "low", "high"])
     total = float(table["value"].sum()) if len(table) else 0.0
-    return {"scenarios": table, "total": total, "program": program,
+    return {"scenarios": table, "total": total, "program": program, "warnings": warnings,
             "range": (low_total, high_total) if len(table) else (0.0, 0.0)}
 
 
 def break_even_per_person(value: float, people: float) -> float:
     """Most a program can cost per person per year and still pay for itself."""
     return value / people if people else 0.0
+
+
+def exposure_vs_opportunity(costs: dict[str, Any], value: dict[str, Any]) -> dict[str, float]:
+    """Keep the two ideas apart: exposure is what turnover and absence cost today; opportunity
+    is the smaller part a modeled engagement program is associated with. An opportunity is
+    not a realized return."""
+    exposure = float(costs.get("total_cost", 0.0))
+    opportunity = float(value.get("total", 0.0))
+    return {"exposure": exposure, "opportunity": opportunity,
+            "opportunity_share": opportunity / exposure if exposure else 0.0}
+
+
+def program_economics(value: dict[str, Any], a: Assumptions) -> dict[str, Any] | None:
+    """ROI, payback and break-even for the named program, given the yearly program cost the
+    user entered. Benefit = modeled value × the share of the effect the program delivers.
+    None until a program cost is entered. Nothing here invents an effect size: the break-even
+    outputs say what would have to be true."""
+    program = value.get("program")
+    if not program or a.program_cost <= 0:
+        return None
+    cost, r = a.program_cost, a.effect_realization
+    cases = {}
+    for name, modeled in (("downside", program["low"]), ("base", program["value"]),
+                          ("upside", program["high"])):
+        benefit = modeled * r
+        cases[name] = {
+            "benefit": benefit, "net": benefit - cost, "roi": (benefit - cost) / cost,
+            "payback_months": 12 * cost / benefit if benefit > 0 else float("inf"),
+            # share of the modeled effect that must be delivered for benefit to equal cost
+            "required_realization": cost / modeled if modeled > 0 else float("inf"),
+        }
+    return {"cost": cost, "realization": r, "cases": cases,
+            "break_even_cost": program["value"] * r,
+            "people": program["people"],
+            "break_even_cost_per_person": break_even_per_person(program["value"] * r,
+                                                                program["people"])}
+
+
+def break_even_lift(df: pd.DataFrame, analysis: dict, a: Assumptions, items: list[str],
+                    max_lift: float = 3.0, fits: dict | None = None) -> dict[str, Any]:
+    """Smallest average rise (in points) for the people who answer 1-3 on the program's
+    questions for the modeled benefit to cover the program cost. Uses the same simulation as
+    the Scenarios page at the estimate, so it answers 'what would have to be true' without
+    assuming any lift. Benefit is turnover plus absence only, times the effect-realization share."""
+    from .scenario import simulate
+
+    cost, r = a.program_cost, a.effect_realization
+    if cost <= 0 or not items:
+        return {"status": "no_cost"}
+
+    def benefit(lift: float) -> float:
+        t = simulate(df, analysis, {i: lift for i in items}, a, who="low", ramp_months=0,
+                     fits=fits)["totals"]["estimate"]
+        return (t["leavers"] * a.cost_per_leaver + t["absence_days"] * a.day_cost) * r
+
+    one = benefit(1.0)
+    if one <= 0:
+        return {"status": "no_effect"}
+    lift = cost / one                      # linear first guess, refined below
+    for _ in range(4):
+        if lift > max_lift:
+            break
+        got = benefit(lift)
+        if got <= 0 or abs(got - cost) / cost < 0.005:
+            break
+        lift *= cost / got
+    if lift > max_lift:
+        return {"status": "unreachable", "max_lift": max_lift, "benefit_at_max": benefit(max_lift)}
+    return {"status": "ok", "lift": float(lift), "benefit_at_one_point": one}
+
+
+def assumption_sensitivity(value: dict[str, Any], a: Assumptions) -> pd.DataFrame:
+    """How the program's base value moves when the economic assumptions change, holding the
+    statistical result fixed. Separate from the 95% range, which is statistical uncertainty only."""
+    program = value.get("program")
+    if not program:
+        return pd.DataFrame(columns=["assumption", "setting", "value", "change"])
+    est = program["physical"]["estimate"]
+    base = est["leavers"] * a.cost_per_leaver + est["absence_days"] * a.day_cost
+    rows = []
+
+    def add(name: str, setting: str, v: float) -> None:
+        rows.append({"assumption": name, "setting": setting, "value": v,
+                     "change": v / base - 1 if base else 0.0})
+
+    if est["leavers"] > 0:
+        for pct in (0.25, 0.5, 1.0, 1.5, 2.0):
+            add("Cost to replace a leaver", f"{pct:.0%} of salary",
+                est["leavers"] * a.avg_salary * pct + est["absence_days"] * a.day_cost)
+    if est["absence_days"] > 0:
+        for mult in (0.5, 1.0, 1.5):
+            add("Cost of an absence day", f"{mult:g} × {money(a.day_cost, a.currency)}",
+                est["leavers"] * a.cost_per_leaver + est["absence_days"] * a.day_cost * mult)
+    for share in (0.25, 0.5, 0.75, 1.0):
+        add("Share of the modeled effect delivered", f"{share:.0%}", base * share)
+    return pd.DataFrame(rows)
 
 
 # PROCESS 6 – WHERE THE MONEY IS (fix 6)
@@ -409,6 +598,207 @@ def money_warning(df: pd.DataFrame, health_report: dict | None = None) -> str | 
             "between engagement and turnover look weaker than they are, and the figures scale "
             "up from respondents, who leave less often than people who did not answer. The "
             "ranges shown reflect sampling error only, not this bias.")
+
+
+# PROCESS 7B – CALCULATION RECEIPTS AND THE GALLUP BENCHMARK CHECK
+
+# Published observed business-unit correlations between engagement and outcomes
+# (Gallup Q12 meta-analysis, 11th edition, 2024, Table 3: mean observed r and observed SD
+# across studies). Engagement here is the equally weighted mean of the Q12 items.
+GALLUP_OBSERVED = {
+    "turnover": {"label": "Voluntary turnover", "r": -0.10, "sd": 0.06},
+    "absence": {"label": "Unplanned absence", "r": -0.26, "sd": 0.13},
+    "performance": {"label": "Performance (Gallup: productivity)", "r": 0.14, "sd": 0.08},
+}
+GALLUP_TOP_VS_BOTTOM_QUARTILE = {
+    "turnover": "21% lower in high-turnover organizations, 51% lower in low-turnover ones",
+    "absence": "78% lower",
+}
+
+
+def gallup_benchmark_check(df: pd.DataFrame) -> pd.DataFrame:
+    """Does the link between team engagement and team outcomes in this data look like what
+    Gallup finds across organizations? Compares the team-level correlation of the Q12 average
+    with each outcome to Gallup's published observed correlations (mean ± 1.28 SDs, roughly the
+    middle 80% of studies). A plausibility check only: it does not feed any dollar figure,
+    because Gallup's figures are business-unit correlations, not the individual-level effects
+    the money pages use. Outcomes count everyone; the Q12 average counts respondents."""
+    from .data_ingestion import Q12_ITEMS
+
+    people = outcome_frame(df)
+    survey = analysis_frame(df)
+    items = [i for i in Q12_ITEMS if i in survey.columns]
+    if "team_id" not in people.columns or not items:
+        return pd.DataFrame()
+    team = survey.assign(q12=survey[items].mean(axis=1)).groupby("team_id").agg(
+        q12=("q12", "mean"), answered=("q12", "size"))
+    out_cols = {"turnover": TURNOVER, "absence": ABSENCE, "performance": "performance_rating"}
+    rows = []
+    for key, column in out_cols.items():
+        if column not in people.columns:
+            continue
+        size = people.groupby("team_id").size()
+        rate = people.groupby("team_id")[column].mean()
+        joined = pd.concat([team, rate.rename("outcome"), size.rename("people")], axis=1).dropna()
+        joined = joined[(joined["people"] >= MIN_TEAM_SIZE) & (joined["answered"] >= MIN_TEAM_SIZE)]
+        if len(joined) < 30 or joined["q12"].std() == 0 or joined["outcome"].std() == 0:
+            continue
+        ours = float(joined["q12"].corr(joined["outcome"]))
+        g = GALLUP_OBSERVED[key]
+        low, high = sorted([g["r"] - 1.28 * g["sd"], g["r"] + 1.28 * g["sd"]])
+        if g["r"] < 0:
+            verdict = ("weaker than Gallup usually finds" if ours > high else
+                       "stronger than Gallup usually finds" if ours < low else
+                       "within the range Gallup finds")
+        else:
+            verdict = ("weaker than Gallup usually finds" if ours < low else
+                       "stronger than Gallup usually finds" if ours > high else
+                       "within the range Gallup finds")
+        rows.append({"outcome": g["label"], "teams": len(joined), "this_data_r": ours,
+                     "gallup_r": g["r"], "gallup_low": low, "gallup_high": high,
+                     "verdict": verdict})
+    return pd.DataFrame(rows)
+
+
+def _source_lines(a: Assumptions, sample: int) -> dict[str, tuple[str, str]]:
+    register = assumption_register(a, sample)
+    return {r["assumption"]: (r["value"], r["source"]) for _, r in register.iterrows()}
+
+
+def calculation_receipts(df: pd.DataFrame, analysis: dict | None, a: Assumptions,
+                         costs: dict[str, Any] | None = None, value: dict[str, Any] | None = None,
+                         economics: dict[str, Any] | None = None,
+                         health_report: dict | None = None) -> list[dict[str, Any]]:
+    """One receipt per material dollar figure: population, model result, scenario, financial
+    inputs, formula, result, source and limitations, so 'show me exactly how you calculated
+    that' can be answered from the same numbers the page shows."""
+    c = a.currency
+    people = outcome_frame(df)
+    n = len(people)
+    wave = model_wave(df)
+    costs = costs or current_costs(df, a)
+    reg = _source_lines(a, n)
+
+    def inputs(*labels: str) -> list[str]:
+        return [f"{label}: {reg[label][0]}; source: {reg[label][1]}" for label in labels if label in reg]
+
+    note = money_warning(df, health_report)
+    common = ["These are associations in the data, not proven cause and effect."]
+    if note:
+        common.append(note)
+
+    receipts: list[dict[str, Any]] = [{
+        "figure": "What turnover and absence cost today",
+        "result": money(costs["total_cost"], c),
+        "population": (f"All {n:,} employees in survey wave {wave}, whether or not they answered "
+                       f"the survey; scaled to a headcount of {costs['headcount']:,}."),
+        "model": "None: counted directly from the outcome file.",
+        "scenario": "Today, nothing changes.",
+        "inputs": inputs("Average salary per year", "Cost to replace one leaver (share of salary)",
+                         "Cost of one unplanned absence day", "Company headcount"),
+        "formula": ("Turnover cost = leavers × cost per leaver. Absence cost = absence days × cost "
+                    "per day. Leavers = turnover rate × employees × (headcount ÷ employees). "
+                    "Absence days = average 6-month absence days × 2 × employees × (headcount ÷ employees)."),
+        "calculation": [
+            f"Turnover: {costs.get('leavers', 0):,.0f} leavers × {money(a.cost_per_leaver, c)} = "
+            f"{money(costs.get('turnover_cost', 0), c)}",
+            f"Absence: {costs.get('absence_days', 0):,.0f} days × {money(a.day_cost, c)} = "
+            f"{money(costs.get('absence_cost', 0), c)}",
+        ],
+        "source": "individual_outcomes file: left_voluntarily_12m and unplanned_absence_days_6m.",
+        "limits": ["The 6-month absence window is doubled to a year, which assumes absence is "
+                   "spread evenly across the year.",
+                   "Counts all voluntary turnover, not only the part linked to engagement."],
+    }]
+
+    program = (value or {}).get("program")
+    if program and analysis is not None:
+        findings = analysis["findings"].set_index(["item", "outcome"])
+        model_lines = []
+        for item in program["items"]:
+            for outcome, unit in (("turnover", "odds ratio"), ("absence", "rate ratio")):
+                if (item, outcome) in findings.index:
+                    f = findings.loc[(item, outcome)]
+                    model_lines.append(f"{item} and {outcome}: {unit} {float(f['effect']):.2f} per "
+                                       f"point (95% interval {float(f['ci_low']):.2f} to "
+                                       f"{float(f['ci_high']):.2f}), passed all checks")
+        phys = program["physical"]
+        lo, hi = value["range"]
+        receipts.append({
+            "figure": f"Value of lifting {program['names']}",
+            "result": f"{money(program['value'], c)} a year (likely {money(program['low'], c)} to "
+                      f"{money(program['high'], c)})",
+            "population": (f"{program['people']:,.0f} employees (scaled to headcount) who answer "
+                           f"1–3 on {program['names']}; fitted on survey respondents in wave {wave}."),
+            "model": model_lines or ["No verified turnover or absence link."],
+            "scenario": (f"Everyone who answers 1–3 on {program['names']} moves up one point; "
+                         "everything else stays as it is today."),
+            "inputs": inputs("Cost to replace one leaver (share of salary)",
+                             "Cost of one unplanned absence day", "Company headcount"),
+            "formula": ("For each person the verified model predicts the chance of leaving (and "
+                        "expected absence days) today and again after the one-point rise. The "
+                        "difference, added across people and scaled to headcount, is the leavers "
+                        "and days avoided. Value = leavers avoided × cost per leaver + absence "
+                        "days avoided × cost per day. The range repeats this with each model "
+                        "link at the edges of its 95% interval."),
+            "calculation": [
+                f"Leavers avoided: {phys['estimate']['leavers']:,.0f} "
+                f"(range {phys['cautious']['leavers']:,.0f} to {phys['optimistic']['leavers']:,.0f})",
+                f"Absence days avoided: {phys['estimate']['absence_days']:,.0f}",
+                f"Value: {phys['estimate']['leavers']:,.0f} × {money(a.cost_per_leaver, c)} + "
+                f"{phys['estimate']['absence_days']:,.0f} × {money(a.day_cost, c)} = "
+                f"{money(program['value'], c)}",
+            ],
+            "source": "Verified findings from the Outcomes analysis; same engine as the Scenarios page.",
+            "limits": common + ["The range reflects sampling error only, not the economic "
+                                "assumptions (see the sensitivity table) or the survey-response bias.",
+                                "A modeled opportunity is not a realized return: it assumes a program "
+                                "can actually move these scores."],
+        })
+
+    if economics:
+        base = economics["cases"]["base"]
+        receipts.append({
+            "figure": "Return on the program cost you entered",
+            "result": f"net {money(base['net'], c)}, ROI {base['roi']:.0%}",
+            "population": "The same people as the program above.",
+            "model": ["Uses the program value above; no new statistics."],
+            "scenario": (f"The program costs {money(economics['cost'], c)} a year and delivers "
+                         f"{economics['realization']:.0%} of the modeled effect."),
+            "inputs": inputs("Yearly program cost", "Share of the modeled effect the program delivers"),
+            "formula": ("Benefit = modeled value × share delivered. Net = benefit − cost. ROI = net ÷ cost. "
+                        "Payback (months) = 12 × cost ÷ benefit. Break-even cost = benefit. "
+                        "Share of the modeled effect needed to break even = cost ÷ modeled value."),
+            "calculation": [
+                f"Benefit: {money(base['benefit'], c)}; net: {money(base['net'], c)}; "
+                f"payback: {base['payback_months']:.1f} months",
+                f"Break-even: the program can cost up to {money(economics['break_even_cost'], c)} a year "
+                f"({money(economics['break_even_cost_per_person'], c)} per person), or must deliver "
+                f"at least {base['required_realization']:.0%} of the modeled effect.",
+            ],
+            "source": "Program cost and share delivered are your assumptions, not evidence.",
+            "limits": ["The effect of any real program on these scores is not known from the data; "
+                       "this shows what would have to be true, not what will happen."],
+        })
+    return receipts
+
+
+def receipt_markdown(receipt: dict[str, Any]) -> str:
+    """One receipt as markdown ('$' escaped for Streamlit)."""
+    def bullets(items: list[str]) -> str:
+        return "\n".join(f"- {x}" for x in items)
+
+    text = (f"**{receipt['figure']}: {receipt['result']}**\n\n"
+            f"**Who is counted:** {receipt['population']}\n\n"
+            f"**Model result:** " + ("\n" + bullets(receipt["model"]) if isinstance(receipt["model"], list)
+                                      else receipt["model"]) + "\n\n"
+            f"**Scenario:** {receipt['scenario']}\n\n"
+            f"**Inputs:**\n{bullets(receipt['inputs'])}\n\n"
+            f"**Formula:** {receipt['formula']}\n\n"
+            f"**Calculation:**\n{bullets(receipt['calculation'])}\n\n"
+            f"**Source:** {receipt['source']}\n\n"
+            f"**Limits:**\n{bullets(receipt['limits'])}")
+    return md(text)
 
 
 # PROCESS 8 – PLAIN LANGUAGE

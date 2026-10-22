@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 
 from .audit import audit_sample
-from .financial_updated import Assumptions, default_assumptions, money
+from .financial_updated import Assumptions, default_assumptions, money, resolve_point_value
 from .insights import ITEM_LABELS, _robust_favorable
 from .model_spec import SPECS, design_matrix, fit_outcome_model
 from .visualization import HIGH_COLOR
@@ -78,12 +78,13 @@ def _simulate_outcome(sample, scope, outcome, analysis, lifts, who, links,
     """Yearly change in one outcome for the people in scope, per bound."""
     spec = SPECS[outcome]
     extra = _extras(analysis, outcome)
-    if fits is not None and (outcome, extra) in fits:       # one fit per outcome, reused
-        fit = fits[(outcome, extra)]
+    key = (len(sample), outcome, extra)
+    if fits is not None and key in fits:                    # one fit per outcome, reused
+        fit = fits[key]
     else:
         fit = fit_outcome_model(sample, outcome, extra)
         if fits is not None:
-            fits[(outcome, extra)] = fit
+            fits[key] = fit
     X0 = design_matrix(sample, outcome, extra).loc[scope.index]
     ratio = spec.method in ("logit", "negbin")
     standardized = set(spec.standardize)
@@ -129,7 +130,9 @@ def simulate(df: pd.DataFrame, analysis: dict, lifts: dict[str, float],
     """Run one scenario. lifts = {'Q04': 0.3, ...} in points on the 1-5 scale.
     `fits` (optional dict) lets several scenarios on the same data share one model fit."""
     sample = audit_sample(df)
-    a = assumptions or default_assumptions(df)
+    a = resolve_point_value(df, assumptions or default_assumptions(df))
+    if fits is None:                  # fits are small (coefficients only): keep them on the analysis
+        fits = analysis.setdefault("_fit_cache", {})
     scale = a.scale(len(sample))
     scope = sample if not department else sample[sample["department"] == department]
     if scope.empty:

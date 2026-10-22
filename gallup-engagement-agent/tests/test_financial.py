@@ -9,7 +9,16 @@ from src.tools.analytics import analyze_dataframe
 from src.tools.waves import model_sample, model_wave
 from src.tools.financial_updated import (
     Assumptions,
+    assumption_register,
+    assumption_sensitivity,
     assumptions_line,
+    break_even_lift,
+    calculation_receipts,
+    exposure_vs_opportunity,
+    gallup_benchmark_check,
+    program_economics,
+    receipt_markdown,
+    resolve_point_value,
     break_even_per_person,
     current_costs,
     default_assumptions,
@@ -357,3 +366,124 @@ def test_where_money_story_uses_commas_and_small_shares():
     assert "12,000 teams" in story["headline"]
     top10 = next(p for p in story["points"] if "costliest" in p)
     assert "<1% of that extra cost" in top10 and " 0% " not in top10
+
+
+# PROCESS 9 – EV ADDITIONS (utility-analysis point value, ROI, break-even, receipts, benchmark)
+
+def test_point_value_from_sd_of_productivity(data):
+
+    a = resolve_point_value(data, Assumptions(avg_salary=50_000, sd_productivity_pct=0.4))
+    sd = outcome_frame(data)["performance_rating"].std()
+
+    assert a.value_per_rating_point == pytest.approx(50_000 * 0.4 / sd)
+    # an explicit value always wins, and zero means off
+    explicit = resolve_point_value(data, Assumptions(value_per_rating_point=900, sd_productivity_pct=0.4))
+    assert explicit.value_per_rating_point == 900
+    assert resolve_point_value(data, Assumptions()).value_per_rating_point == 0
+
+
+def test_register_labels_every_source():
+
+    default = assumption_register(Assumptions(), 1_000).set_index("assumption")["source"]
+    assert default.isin(["Application default (placeholder)", "Taken from your data",
+                         "Not entered"]).all()
+    assert "User-entered (source not stated)" in set(
+        assumption_register(Assumptions(avg_salary=70_000), 1_000)["source"])
+
+    changed = assumption_register(
+        Assumptions(avg_salary=80_000, sources={"avg_salary": "Company-provided"}), 1_000)
+    row = changed[changed["assumption"].str.contains("salary", case=False)].iloc[0]
+    assert row["source"] == "Company-provided" and "80,000" in row["value"]
+
+
+def test_exposure_is_not_opportunity(data, analysis):
+
+    a = default_assumptions(data)
+    costs, value = current_costs(data, a), engagement_value(data, analysis, a)
+    split = exposure_vs_opportunity(costs, value)
+
+    assert split["exposure"] == costs["total_cost"] and split["opportunity"] == value["total"]
+    assert 0 < split["opportunity_share"] < 1
+
+
+def test_economics_wait_for_a_program_cost(data, analysis):
+
+    a = default_assumptions(data)
+    assert program_economics(engagement_value(data, analysis, a), a) is None
+
+    a = default_assumptions(data, program_cost=100_000)
+    value = engagement_value(data, analysis, a)
+    econ = program_economics(value, a)
+    base = econ["cases"]["base"]
+
+    assert base["net"] == pytest.approx(value["program"]["value"] - 100_000)
+    assert base["roi"] == pytest.approx(base["net"] / 100_000)
+    assert econ["cases"]["downside"]["net"] <= base["net"] <= econ["cases"]["upside"]["net"]
+    # at break-even cost the net is zero; the share needed is cost / modeled value
+    assert base["required_realization"] == pytest.approx(100_000 / value["program"]["value"])
+    assert econ["break_even_cost"] == pytest.approx(value["program"]["value"])
+
+
+def test_realization_scales_benefit_not_the_statistics(data, analysis):
+
+    full = default_assumptions(data, program_cost=100_000)
+    half = default_assumptions(data, program_cost=100_000, effect_realization=0.5)
+    value = engagement_value(data, analysis, full)
+
+    assert (program_economics(value, half)["cases"]["base"]["benefit"]
+            == pytest.approx(0.5 * program_economics(value, full)["cases"]["base"]["benefit"]))
+
+
+def test_break_even_lift_recovers_the_cost(data, analysis):
+
+    a = default_assumptions(data)
+    value = engagement_value(data, analysis, a)
+    cost = value["program"]["value"] / 2          # half the modeled value, so the lift is below 1
+    a = default_assumptions(data, program_cost=cost)
+    result = break_even_lift(data, analysis, a, value["program"]["items"])
+
+    assert result["status"] == "ok" and 0 < result["lift"] < 1.0
+
+    cheap = break_even_lift(data, analysis, default_assumptions(data), value["program"]["items"])
+    assert cheap["status"] == "no_cost"
+    huge = default_assumptions(data, program_cost=value["program"]["value"] * 1_000)
+    assert break_even_lift(data, analysis, huge, value["program"]["items"])["status"] == "unreachable"
+
+
+def test_sensitivity_changes_only_economics(data, analysis):
+
+    a = default_assumptions(data)
+    value = engagement_value(data, analysis, a)
+    table = assumption_sensitivity(value, a)
+
+    assert {"Cost to replace a leaver", "Share of the modeled effect delivered"} <= set(table["assumption"])
+    same = table[(table["assumption"] == "Cost to replace a leaver")
+                 & (table["setting"] == "50% of salary")]
+    assert same["value"].iloc[0] == pytest.approx(value["program"]["value"], rel=1e-6)
+    assert table.duplicated(["assumption", "setting"]).sum() == 0
+
+
+def test_receipts_cover_the_figures_and_render(data, analysis):
+
+    a = default_assumptions(data, program_cost=250_000)
+    costs, value = current_costs(data, a), engagement_value(data, analysis, a)
+    econ = program_economics(value, a)
+    receipts = calculation_receipts(data, analysis, a, costs, value, econ)
+
+    assert len(receipts) >= 3
+    for receipt in receipts:
+        text = receipt_markdown(receipt)
+        assert isinstance(text, str) and len(text) > 40
+    assert any("source" in receipt_markdown(r).lower() for r in receipts)
+
+
+def test_gallup_check_compares_team_level_correlations(data):
+
+    bench = gallup_benchmark_check(data)
+
+    assert not bench.empty
+    assert set(bench["verdict"]) <= {"within the range Gallup finds",
+                                     "weaker than Gallup usually finds",
+                                     "stronger than Gallup usually finds"}
+    assert (bench["gallup_low"] < bench["gallup_r"]).all() and (bench["gallup_r"] < bench["gallup_high"]).all()
+    assert (bench["this_data_r"].abs() <= 1).all()

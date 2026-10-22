@@ -37,8 +37,13 @@ from .financial_updated import (
     default_assumptions,
     Assumptions,
     current_costs,
+    assumption_register,
+    calculation_receipts,
     department_excess_cost,
+    exposure_vs_opportunity,
+    gallup_benchmark_check,
     money_warning,
+    program_economics,
     team_cost_persistence,
     engagement_value,
     money,
@@ -370,6 +375,39 @@ def _financials(df, analysis, change, a, risk_results=None) -> dict:
                            "value": money(r["value"], c)}
                           for _, r in value["scenarios"].iterrows()],
         }
+    if analysis is not None and program:
+        split = exposure_vs_opportunity(costs, value)
+        section["exposure_vs_opportunity"] = (
+            f"Turnover and absence cost {money(split['exposure'], c)} a year today (exposure). "
+            f"The modeled program is {split['opportunity_share']:.0%} of that (opportunity, "
+            "not a realized return).")
+        economics = program_economics(value, a)
+        if economics:
+            base = economics["cases"]["base"]
+            section["program_economics"] = {
+                "program_cost": money(economics["cost"], c),
+                "net_value_per_year": money(base["net"], c),
+                "return_on_investment": f"{base['roi']:.0%}",
+                "break_even_cost": money(economics["break_even_cost"], c),
+                "share_of_modeled_effect_needed_to_break_even": f"{base['required_realization']:.0%}",
+                "note": "Uses the program cost and realization share the user entered.",
+            }
+        register = assumption_register(a, int(costs["headcount"]))
+        entered = register[~register["source"].isin(
+            ["Application default (placeholder)", "Taken from your data", "Not entered"])]
+        section["assumption_sources"] = (
+            [f"{r['assumption']}: {r['value']} ({r['source']})" for _, r in entered.iterrows()]
+            + ["Others: defaults or from the data."])
+        bench = gallup_benchmark_check(df)
+        if not bench.empty:
+            section["gallup_plausibility_check"] = {
+                "rows": [f"{r['outcome']}: team-level r {r['this_data_r']:.2f} here, Gallup "
+                         f"average {r['gallup_r']:.2f}; {r['verdict']}" for _, r in bench.iterrows()],
+            }
+        section["calculation_receipts"] = [
+            {"figure": r["figure"], "result": r["result"], "formula": r["formula"][:160]}
+            for r in calculation_receipts(df, analysis, a, costs, value, economics,
+                                          _health(analysis))[:2]]
     if analysis is not None:
         factors = factor_value(df, analysis, a)
         if not factors.empty:

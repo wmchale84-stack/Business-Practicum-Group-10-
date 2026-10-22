@@ -40,3 +40,28 @@ and read from the health report). Imports in the other test files were updated f
   belongs to the Prediction Review, not this change.
 - **Speed.** The factor ranking fits each outcome model once per analysis (about 30 s on 2M the
   first time, then cached on the analysis).
+
+## Second update: Sunny's EV brief and the Gallup methodology notes
+
+Analysis of what was taken and what was not is in the hand-off message; the code is below. All
+on branch `Will`, committed locally, not pushed.
+
+| Idea from the brief | Change | Where |
+|---|---|---|
+| Exposure vs opportunity | `exposure_vs_opportunity()`; page caption and Ask AI fact | `financial_updated.py`, `financials.py`, `agent_context.py` |
+| Assumption registry with source labels | `Assumptions.sources`, `assumption_register()`; source picker in the form; table under "Assumptions and limits"; placeholders are labelled as placeholders | same |
+| ROI, net value, payback | `program_economics()` from a user-entered yearly program cost and a "share of modeled effect delivered" slider; downside/base/upside from the 95% range | same |
+| Break-even / threshold | break-even cost, required share of the modeled effect, and `break_even_lift()` (the smallest average rise for 1-3 scorers that covers the cost, from the Scenarios engine; no lift is assumed) | same |
+| Uncertainty vs sensitivity | `assumption_sensitivity()` table, kept apart from the 95% statistical range | same |
+| Calculation receipts | `calculation_receipts()` / `receipt_markdown()`; expander on the page; short version in Ask AI facts | same |
+| Double-counting and guardrail warnings | `engagement_value()["warnings"]` shown under the program | `financial_updated.py` |
+| Utility-analysis productivity value (Hunter-Schmidt, as Gallup describes) | optional `sd_productivity_pct`; value per point = salary × SD% ÷ SD(rating); off by default; explicit value wins | `financial_updated.py`, `scenario.py`, `priorities.py` |
+| Gallup 2024 meta-analysis as a check | `gallup_benchmark_check()`: team-level correlations vs Gallup's observed mean ± 1.28 SD; plausibility only, never feeds dollars | `financial_updated.py`, `financials.py` |
+
+Not implemented on purpose: Gallup's top-down cost-of-disengagement figure (proprietary
+classification and GDP method, excludes turnover); using Gallup's correlations or its reported
+engagement growth as an effect size in dollars; a default for the SD of productivity; the brief's
+later phases (intervention library, optimizer, learning loop), which need evidence this data does not hold.
+
+Tests: `tests/test_financial.py` now has 44 tests; `tests/test_app_pages.py` has a page test with a program
+cost entered. Ask AI facts stay under the 20,000-character limit.

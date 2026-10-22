@@ -3,9 +3,14 @@
 import streamlit as st
 
 from src.tools.financial_updated import (
+    SOURCE_OPTIONS,
     Assumptions,
+    assumption_register,
+    assumption_sensitivity,
     assumptions_line,
+    break_even_lift,
     break_even_per_person,
+    calculation_receipts,
     current_costs,
     default_assumptions,
     department_excess_cost,
@@ -13,11 +18,15 @@ from src.tools.financial_updated import (
     excess_cost_chart,
     explain_departments,
     explain_where_money,
+    exposure_vs_opportunity,
+    gallup_benchmark_check,
     md,
     money,
     money_warning,
     outcome_frame,
+    program_economics,
     range_text,
+    receipt_markdown,
     team_cost_persistence,
     team_excess_cost,
 )
@@ -100,20 +109,59 @@ with edit_col.popover("Edit assumptions", icon=":material/edit:", width="stretch
             "Company headcount", min_value=1,
             value=int(assumptions.headcount or sample), step=100,
             help=f"The data has {sample:,} people; results scale to this number.")
+        sd_pct = st.number_input(
+            "SD of productivity value (% of salary, 0 = off)", min_value=0.0, max_value=200.0,
+            value=float(assumptions.sd_productivity_pct * 100), step=5.0, format="%.0f",
+            help="Prices a performance point with the utility-analysis formula (the method "
+                 "Gallup cites for productivity): value of a point = this share of salary ÷ the "
+                 "spread of ratings. Ignored if you enter a value per point above. A rule of "
+                 "thumb often cited in the utility-analysis literature is about 40%; check it "
+                 "with your finance team before relying on it.")
+        program_cost = st.number_input(
+            "Yearly cost of the program you are considering (0 = not entered)", min_value=0.0,
+            value=float(assumptions.program_cost), step=10000.0, format="%.0f",
+            help="Used for return on investment and break-even. It is your assumption, not "
+                 "something the data can tell us.")
+        realization = st.slider(
+            "Share of the modeled effect the program delivers (%)", min_value=10, max_value=100,
+            value=int(round(assumptions.effect_realization * 100)), step=5,
+            help="100% assumes the program moves scores as far as the scenario. Lower it to "
+                 "test a program that falls short.")
         currency = st.selectbox(
             "Currency symbol", options=["$", "€", "£", "Rp", "¥"],
             index=["$", "€", "£", "Rp", "¥"].index(assumptions.currency))
+        source = st.selectbox(
+            "Where did the numbers you changed come from?", options=SOURCE_OPTIONS,
+            help="Recorded next to each changed number in the assumptions list.")
 
         if st.form_submit_button("Apply", type="primary", icon=":material/check:",
                                  width="stretch"):
-            st.session_state["assumptions"] = Assumptions(
+            new = Assumptions(
                 avg_salary=avg_salary,
                 replacement_cost_pct=replacement_pct / 100,
                 absence_day_cost=day_cost or None,
                 value_per_rating_point=point_value,
                 headcount=int(headcount),
                 currency=currency,
+                program_cost=program_cost,
+                effect_realization=realization / 100,
+                sd_productivity_pct=sd_pct / 100,
             )
+            placeholder = Assumptions()
+            labels = {"avg_salary": new.avg_salary, "replacement_cost_pct": new.replacement_cost_pct,
+                      "absence_day_cost": new.absence_day_cost,
+                      "value_per_rating_point": new.value_per_rating_point,
+                      "sd_productivity_pct": new.sd_productivity_pct,
+                      "program_cost": new.program_cost,
+                      "effect_realization": new.effect_realization}
+            kept = assumptions.sources
+            new.sources = {
+                key: (source if value != getattr(assumptions, key) or key not in kept else kept[key])
+                for key, value in labels.items() if value != getattr(placeholder, key)}
+            if int(headcount) != sample:
+                new.sources["headcount"] = (source if int(headcount) != assumptions.headcount
+                                            else kept.get("headcount", source))
+            st.session_state["assumptions"] = new
             st.rerun()
 
 
@@ -211,6 +259,47 @@ if analysis is not None:
                 f"- **{row['source']}:** {md(row['what'])}."
                 for _, row in scenarios.iterrows()))
 
+            split = exposure_vs_opportunity(costs, value)
+            st.caption(md(
+                f":material/compare_arrows: Exposure vs opportunity: turnover and absence cost "
+                f"{money(split['exposure'], c)} a year today (the exposure). The modeled "
+                f"opportunity is {split['opportunity_share']:.0%} of that. An opportunity is not "
+                "a realized return."))
+            for warning in value["warnings"]:
+                st.caption(f":material/warning: {warning}")
+
+            economics = program_economics(value, assumptions) if program else None
+            if economics:
+                base = economics["cases"]["base"]
+                low_case, high_case = economics["cases"]["downside"], economics["cases"]["upside"]
+                roi_tiles = [
+                    ("Net value, per year", money(base["net"], c),
+                     f"{money(low_case['net'], c)} to {money(high_case['net'], c)}"),
+                    ("Return on investment", f"{base['roi']:.0%}",
+                     f"{low_case['roi']:.0%} to {high_case['roi']:.0%}"),
+                    ("Payback", ("not reached" if base["payback_months"] == float("inf")
+                                 else f"{base['payback_months']:.1f} months"),
+                     f"program cost {money(economics['cost'], c)} a year"),
+                    ("Break-even cost", money(economics["break_even_cost"], c),
+                     f"{money(economics['break_even_cost_per_person'], c)} per person"),
+                ]
+                for (label, val, detail), column in zip(roi_tiles, st.columns(len(roi_tiles))):
+                    column.metric(label, val, delta=detail, delta_color="off",
+                                  delta_arrow="off", border=True)
+                lift = break_even_lift(df, analysis, assumptions, program["items"])
+                need = (f"must move the people who answer 1–3 up by at least "
+                        f"{lift['lift']:.2f} points on average" if lift["status"] == "ok" else
+                        "cannot break even within a 3-point rise" if lift["status"] == "unreachable"
+                        else "has no modeled effect to break even on")
+                st.markdown(md(
+                    f"**What would have to be true:** at {economics['realization']:.0%} of the "
+                    f"modeled effect, the program {need}, or deliver at least "
+                    f"{base['required_realization']:.0%} of the modeled effect. The data cannot "
+                    "say whether a real program will do that."))
+            elif program:
+                st.caption(":material/savings: Enter a yearly program cost under **Edit assumptions** "
+                           "to see return on investment, payback and break-even.")
+
         if plans is not None and assumptions.value_per_rating_point <= 0:
             st.caption(":material/info: Add a value for +1 performance point under **Edit "
                        "assumptions** to include the productivity plans from Recommendations.")
@@ -225,6 +314,32 @@ if analysis is not None:
             "describe associations in your data, not guaranteed returns.",
             "How these figures work",
         )
+
+        if program:
+            with st.expander("Sensitivity to the economic assumptions", icon=":material/tune:"):
+                sensitivity = assumption_sensitivity(value, assumptions)
+                st.dataframe(
+                    sensitivity, hide_index=True, width="stretch", height="content",
+                    column_config={
+                        "assumption": "Assumption",
+                        "setting": "If it were",
+                        "value": st.column_config.NumberColumn("Program value, per year",
+                                                               format="compact"),
+                        "change": st.column_config.NumberColumn("Change", format="percent"),
+                    },
+                    alt="Program value under other economic assumptions")
+                st.caption("Each row changes one assumption and holds the statistical result "
+                           "fixed. The 95% range above is statistical uncertainty only; this "
+                           "table is the other kind. Data limits are listed in the note at the top.")
+
+        if scenarios is not None and not scenarios.empty:
+            with st.expander("Show exactly how these figures were calculated",
+                             icon=":material/receipt_long:"):
+                for receipt in calculation_receipts(
+                        df, analysis, assumptions, costs, value, economics,
+                        st.session_state.get("health_report")):
+                    st.markdown(receipt_markdown(receipt))
+                    st.divider()
 
 
 # PROCESS 6 – WHERE TO INVEST: FACTORS RANKED BY DOLLARS
@@ -432,6 +547,10 @@ if not teams.empty and (teams["excess_cost"] > 0).any():
 
 with st.expander("Assumptions and limits", icon=":material/rule:"):
 
+    st.dataframe(assumption_register(assumptions, sample), hide_index=True, width="stretch",
+                 height="content", column_config={"assumption": "Assumption", "value": "Value",
+                                                  "source": "Source"},
+                 alt="Every economic assumption with its value and source")
     st.markdown("\n".join(f"- {line}" for line in assumptions.describe(sample)))
     st.caption(
         "Costs today count every employee in the outcome file. Savings come from models fitted "
@@ -440,3 +559,32 @@ with st.expander("Assumptions and limits", icon=":material/rule:"):
         "measured link to profit. To measure that link, add team-level financial results "
         "(for example profit or revenue per team per period) to the data."
     )
+
+
+# PROCESS 9 – PLAUSIBILITY CHECK AGAINST GALLUP'S PUBLISHED FINDINGS
+
+with st.expander("Does your data look like Gallup's research?", icon=":material/fact_check:"):
+
+    bench = gallup_benchmark_check(df)
+    if bench.empty:
+        st.caption("Not enough teams with both survey answers and outcomes to compare.")
+    else:
+        st.dataframe(
+            bench, hide_index=True, width="stretch", height="content",
+            column_config={
+                "outcome": "Outcome",
+                "teams": st.column_config.NumberColumn("Teams", format="%d"),
+                "this_data_r": st.column_config.NumberColumn("Your data (r)", format="%.2f"),
+                "gallup_r": st.column_config.NumberColumn("Gallup average (r)", format="%.2f"),
+                "gallup_low": st.column_config.NumberColumn("Gallup range, low", format="%.2f"),
+                "gallup_high": st.column_config.NumberColumn("Gallup range, high", format="%.2f"),
+                "verdict": "Compared with Gallup",
+            },
+            alt="Team-level correlation of engagement with outcomes, against Gallup's research")
+    st.caption(
+        "Gallup's 2024 Q12 meta-analysis reports business-unit-level correlations between "
+        "engagement and outcomes. This table compares them with the same team-level "
+        "correlations in your data; the range is the middle 80% of Gallup's studies. It is a "
+        "plausibility check only. No dollar figure above uses Gallup's numbers: they describe "
+        "groups, not individual employees, and Gallup's own cost-of-disengagement estimate "
+        "relies on a proprietary classification we cannot reproduce.")
